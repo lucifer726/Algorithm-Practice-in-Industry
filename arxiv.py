@@ -12,6 +12,7 @@ import datetime
 from tqdm import tqdm
 from translate import translate
 import feedparser
+from pypdf import PdfReader
 
 
 SERVERCHAN_API_KEY = os.environ.get("SERVERCHAN_API_KEY", None)
@@ -22,6 +23,7 @@ FEISHU_URLS = os.environ.get("FEISHU_URL", "").split(',')
 # 去除空字符串和空格
 FEISHU_URLS = [url.strip() for url in FEISHU_URLS if url.strip()]
 MODEL_TYPE = os.environ.get("MODEL_TYPE", "DeepSeek")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
 def get_yesterday():
     today = datetime.datetime.now()
@@ -30,83 +32,126 @@ def get_yesterday():
 
 
 def search_arxiv_papers(search_term, max_results=10):
-    """
-    从 arXiv 拉取论文，返回字段：
-    title, url, pub_date, summary, authors, affiliations
-    """
     papers = []
-    url = (
-        "http://export.arxiv.org/api/query?"
-        f"search_query=all:{search_term}"
-        f"&start=0&max_results={max_results}"
-        f"&sortBy=submittedDate&sortOrder=descending"
-    )
 
-    feed = feedparser.parse(url)
-    if feed.bozo:
-        print("[-] 解析 arXiv feed 失败")
+    url = f'http://export.arxiv.org/api/query?' + \
+          f'search_query=all:{search_term}' +  \
+          f'&start=0&&max_results={max_results}' + \
+          f'&sortBy=submittedDate&sortOrder=descending'
+
+    response = requests.get(url)
+
+    if response.status_code != 200:
         return []
 
-    print("[+] 开始处理每日最新论文....")
+    feed = response.text
+    entries = feed.split('<entry>')[1:]
 
-    for entry in feed.entries:
-        # 标题
-        title = entry.title.strip().replace("\n", " ").replace("\r", " ")
+    if not entries:
+        return []
 
-        # 摘要
-        summary = entry.summary.strip().replace("\n", " ").replace("\r", " ")
+    print('[+] 开始处理每日最新论文....')
 
-        # 链接（一般用 entry.id）
-        link = getattr(entry, "id", "").strip()
+    for entry in entries:
 
-        # 日期
-        if hasattr(entry, "published"):
-            pub_date_raw = entry.published
-            pub_date = datetime.datetime.strptime(
-                pub_date_raw, "%Y-%m-%dT%H:%M:%SZ"
-            ).strftime("%Y-%m-%d")
-        else:
-            pub_date = ""
+        title = entry.split('<title>')[1].split('</title>')[0].strip()
+        summary = entry.split('<summary>')[1].split('</summary>')[0].strip().replace('\n', ' ').replace('\r', '')
+        url = entry.split('<id>')[1].split('</id>')[0].strip()
+        pub_date = entry.split('<published>')[1].split('</published>')[0]
+        pub_date = datetime.datetime.strptime(pub_date, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d")
 
-        # 作者列表
-        authors = []
-        affiliations = []
-        if hasattr(entry, "authors"):
-            for a in entry.authors:
-                # 作者姓名
-                if hasattr(a, "name"):
-                    authors.append(a.name)
+        first_page_text = get_pdf_first_page_text(url)
+        affiliation = extract_affiliation_with_deepseek(first_page_text)
 
-                # 作者单位 / affiliation（不同 feed 结构略有差异，这里做几种兜底）
-                aff = None
-                # 一种常见情况：a 有 affiliation 字段
-                if hasattr(a, "affiliation"):
-                    aff = a.affiliation
-                # 有些解析成 term 或其他字段
-                if hasattr(a, "term"):
-                    aff = aff or a.term
+        papers.append({
+            'title': title,
+            'affiliation': affiliation,
+            'url': url,
+            'pub_date': pub_date,
+            'summary': summary,
+            'translated': '',
+        })
+    
+    print('[+] 开始翻译每日最新论文并缓存....')
 
-                if aff:
-                    affiliations.append(aff)
-
-        # 去重一下单位
-        affiliations = list(dict.fromkeys(affiliations))
-
-        papers.append(
-            {
-                "title": title,
-                "url": link,
-                "pub_date": pub_date,
-                "summary": summary,
-                "translated": "",
-                "authors": authors,
-                "affiliations": affiliations,
-            }
-        )
-
-    print("[+] 开始翻译每日最新论文并缓存....")
     papers = save_and_translate(papers)
+    
     return papers
+
+def get_pdf_first_page_text(abs_url, timeout=20):
+    """
+    通过 abs 链接构造 pdf 链接，下载并抽取第一页文本。
+    """
+    # 典型 abs 链接: https://arxiv.org/abs/2512.04847v1
+    if "/abs/" not in abs_url:
+        return ""
+
+    pdf_url = abs_url.replace("/abs/", "/pdf/") + ".pdf"
+
+    try:
+        resp = requests.get(pdf_url, timeout=timeout)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[-] 下载 PDF 失败: {pdf_url}, err={e}")
+        return ""
+
+    try:
+        reader = PdfReader(BytesIO(resp.content))
+        if not reader.pages:
+            return ""
+        text = reader.pages[0].extract_text() or ""
+        return text.strip()
+    except Exception as e:
+        print(f"[-] 解析 PDF 失败: {pdf_url}, err={e}")
+        return ""
+
+
+def extract_affiliation_with_deepseek(first_page_text):
+    """
+    调用 DeepSeek，从第一页文本中抽取作者单位。
+    返回一个简短的字符串。
+    """
+    if not DEEPSEEK_API_KEY:
+        print("⚠️ 未设置 DEEPSEEK_API_KEY，跳过单位抽取")
+        return ""
+
+    if not first_page_text.strip():
+        return ""
+
+    url = "https://api.deepseek.com/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    prompt = (
+        "下面是一篇 arXiv 论文 PDF 首页的文字内容。"
+        "请从中提取所有作者的所属单位信息（学校、公司、研究机构等），"
+        "如果有多个单位，请用中文输出，使用中文顿号分隔。"
+        "不要输出任何解释或多余文字，只输出单位列表。"
+        "\n\n论文首页内容：\n"
+        f"{first_page_text}"
+    )
+
+    data = {
+        "model": "deepseek-chat",  # 视你账号实际模型名而定
+        "messages": [
+            {"role": "system", "content": "你是一个信息抽取助手，只输出作者单位列表。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.1,
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, json=data, timeout=60)
+        resp.raise_for_status()
+        result = resp.json()
+        content = result["choices"][0]["message"]["content"].strip()
+        # 这里可以顺手把前后引号、前缀之类清理一下
+        return content
+    except Exception as e:
+        print(f"[-] DeepSeek 抽取单位失败: {e}")
+        return ""
 
 
 def send_wechat_message(title, content, SERVERCHAN_API_KEY):
@@ -235,6 +280,7 @@ def cronjob():
         pub_date = paper['pub_date']
         summary = paper['summary']
         translated = paper['translated']
+        affiliation = paper.get("affiliation", "").strip()
 
         yesterday = get_yesterday()
 
@@ -248,29 +294,19 @@ def cronjob():
         msg_summary = f'Summary：\n\n{summary}'
         msg_translated = f'Translated (Powered by {MODEL_TYPE}):\n\n{translated}'
 
-        authors = paper.get("authors", [])
-        affiliations = paper.get("affiliations", [])
-    
-        msg_authors = ""
-        if authors:
-            msg_authors = "Authors： " + ", ".join(authors)
-    
-        msg_affiliations = ""
-        if affiliations:
-            msg_affiliations = "Affiliations： " + "; ".join(affiliations)
-    
-        push_title = f'Arxiv:{QUERY}[{ii}]@{today}'
-    
-        msg_content = f"[{msg_title}]({url})\n\n{msg_pub_date}\n\n"
-    
-        if msg_authors:
-            msg_content += msg_authors + "\n\n"
-        if msg_affiliations:
-            msg_content += msg_affiliations + "\n\n"
-    
-        msg_content += f"{msg_url}\n\n{msg_translated}\n\n"
+        msg_affiliation = ""
+        if affiliation:
+            msg_affiliation = f'Affiliation（DeepSeek 抽取）：\n{affiliation}'
 
-        send_wechat_message(push_title, msg_content, SERVERCHAN_API_KEY)
+        push_title = f'Arxiv:{QUERY}[{ii}]@{today}'
+        msg_content = f"[{msg_title}]({url})\n\n{msg_pub_date}\n\n"
+
+        if msg_affiliation:
+            msg_content += msg_affiliation + "\n\n"
+        
+        msg_content += f"{msg_url}\n\n{msg_translated}\n\n{msg_summary}\n\n"
+
+        # send_wechat_message(push_title, msg_content, SERVERCHAN_API_KEY)
         send_feishu_message(push_title, msg_content)
 
         time.sleep(12)
