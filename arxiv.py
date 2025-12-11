@@ -11,6 +11,8 @@ import json
 import datetime
 from tqdm import tqdm
 from translate import translate
+import feedparser
+
 
 SERVERCHAN_API_KEY = os.environ.get("SERVERCHAN_API_KEY", None)
 QUERY = os.environ.get('QUERY', 'cs.IR')
@@ -28,46 +30,82 @@ def get_yesterday():
 
 
 def search_arxiv_papers(search_term, max_results=10):
+    """
+    从 arXiv 拉取论文，返回字段：
+    title, url, pub_date, summary, authors, affiliations
+    """
     papers = []
+    url = (
+        "http://export.arxiv.org/api/query?"
+        f"search_query=all:{search_term}"
+        f"&start=0&max_results={max_results}"
+        f"&sortBy=submittedDate&sortOrder=descending"
+    )
 
-    url = f'http://export.arxiv.org/api/query?' + \
-          f'search_query=all:{search_term}' +  \
-          f'&start=0&&max_results={max_results}' + \
-          f'&sortBy=submittedDate&sortOrder=descending'
-
-    response = requests.get(url)
-
-    if response.status_code != 200:
+    feed = feedparser.parse(url)
+    if feed.bozo:
+        print("[-] 解析 arXiv feed 失败")
         return []
 
-    feed = response.text
-    entries = feed.split('<entry>')[1:]
+    print("[+] 开始处理每日最新论文....")
 
-    if not entries:
-        return []
+    for entry in feed.entries:
+        # 标题
+        title = entry.title.strip().replace("\n", " ").replace("\r", " ")
 
-    print('[+] 开始处理每日最新论文....')
+        # 摘要
+        summary = entry.summary.strip().replace("\n", " ").replace("\r", " ")
 
-    for entry in entries:
+        # 链接（一般用 entry.id）
+        link = getattr(entry, "id", "").strip()
 
-        title = entry.split('<title>')[1].split('</title>')[0].strip()
-        summary = entry.split('<summary>')[1].split('</summary>')[0].strip().replace('\n', ' ').replace('\r', '')
-        url = entry.split('<id>')[1].split('</id>')[0].strip()
-        pub_date = entry.split('<published>')[1].split('</published>')[0]
-        pub_date = datetime.datetime.strptime(pub_date, "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d")
+        # 日期
+        if hasattr(entry, "published"):
+            pub_date_raw = entry.published
+            pub_date = datetime.datetime.strptime(
+                pub_date_raw, "%Y-%m-%dT%H:%M:%SZ"
+            ).strftime("%Y-%m-%d")
+        else:
+            pub_date = ""
 
-        papers.append({
-            'title': title,
-            'url': url,
-            'pub_date': pub_date,
-            'summary': summary,
-            'translated': '',
-        })
-    
-    print('[+] 开始翻译每日最新论文并缓存....')
+        # 作者列表
+        authors = []
+        affiliations = []
+        if hasattr(entry, "authors"):
+            for a in entry.authors:
+                # 作者姓名
+                if hasattr(a, "name"):
+                    authors.append(a.name)
 
+                # 作者单位 / affiliation（不同 feed 结构略有差异，这里做几种兜底）
+                aff = None
+                # 一种常见情况：a 有 affiliation 字段
+                if hasattr(a, "affiliation"):
+                    aff = a.affiliation
+                # 有些解析成 term 或其他字段
+                if hasattr(a, "term"):
+                    aff = aff or a.term
+
+                if aff:
+                    affiliations.append(aff)
+
+        # 去重一下单位
+        affiliations = list(dict.fromkeys(affiliations))
+
+        papers.append(
+            {
+                "title": title,
+                "url": link,
+                "pub_date": pub_date,
+                "summary": summary,
+                "translated": "",
+                "authors": authors,
+                "affiliations": affiliations,
+            }
+        )
+
+    print("[+] 开始翻译每日最新论文并缓存....")
     papers = save_and_translate(papers)
-    
     return papers
 
 
@@ -210,8 +248,27 @@ def cronjob():
         msg_summary = f'Summary：\n\n{summary}'
         msg_translated = f'Translated (Powered by {MODEL_TYPE}):\n\n{translated}'
 
+        authors = paper.get("authors", [])
+        affiliations = paper.get("affiliations", [])
+    
+        msg_authors = ""
+        if authors:
+            msg_authors = "Authors： " + ", ".join(authors)
+    
+        msg_affiliations = ""
+        if affiliations:
+            msg_affiliations = "Affiliations： " + "; ".join(affiliations)
+    
         push_title = f'Arxiv:{QUERY}[{ii}]@{today}'
-        msg_content = f"[{msg_title}]({url})\n\n{msg_pub_date}\n\n{msg_url}\n\n{msg_translated}\n\n{msg_summary}\n\n"
+    
+        msg_content = f"[{msg_title}]({url})\n\n{msg_pub_date}\n\n"
+    
+        if msg_authors:
+            msg_content += msg_authors + "\n\n"
+        if msg_affiliations:
+            msg_content += msg_affiliations + "\n\n"
+    
+        msg_content += f"{msg_url}\n\n{msg_translated}\n\n"
 
         send_wechat_message(push_title, msg_content, SERVERCHAN_API_KEY)
         send_feishu_message(push_title, msg_content)
