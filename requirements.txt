@@ -7,3 +7,4 @@ aiohttp
 requests
 jinja2
 feedparser
+pypdf
