@@ -6,3 +6,4 @@ beautifulsoup4
 aiohttp
 requests
 jinja2
+feedparser
