@@ -9,9 +9,9 @@ import requests
 import time
 import json
 import datetime
+from io import BytesIO 
 from tqdm import tqdm
 from translate import translate
-import feedparser
 from pypdf import PdfReader
 
 
