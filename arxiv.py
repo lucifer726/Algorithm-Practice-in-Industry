@@ -4,6 +4,7 @@ credit to original author: Glenn (chenluda01@outlook.com)
 Author: Doragd
 '''
 
+import re
 import os
 import requests
 import time
@@ -69,7 +70,8 @@ def search_arxiv_papers(search_term, max_results=10):
             'url': url,
             'pub_date': pub_date,
             'summary': summary,
-            'translated': '',
+            'translated': '',          # 摘要中文
+            'title_translated': '',    # 标题中文
         })
     
     print('[+] 开始翻译每日最新论文并缓存....')
@@ -147,11 +149,32 @@ def extract_affiliation_with_deepseek(first_page_text):
         resp.raise_for_status()
         result = resp.json()
         content = result["choices"][0]["message"]["content"].strip()
-        # 这里可以顺手把前后引号、前缀之类清理一下
+        content = dedup_affiliation_text(content)
         return content
     except Exception as e:
         print(f"[-] DeepSeek 抽取单位失败: {e}")
         return ""
+
+
+def dedup_affiliation_text(text: str) -> str:
+    """
+    对 DeepSeek 返回的单位字符串做去重和清洗：
+    - 按 顿号/逗号/分号/换行 切分
+    - 去掉空字符串
+    - 去重但保留原顺序
+    """
+    if not text:
+        return ""
+    parts = re.split(r"[、,;；\n]+", text)
+    seen = set()
+    result = []
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.add(p)
+            result.append(p)
+    return "、".join(result)
+
 
 
 def send_wechat_message(title, content, SERVERCHAN_API_KEY):
@@ -214,38 +237,61 @@ def send_feishu_message(title, content, urls=None):
 
 
 def save_and_translate(papers, filename='arxiv.json'):
-    with open(filename, 'r', encoding='utf-8') as f:
-        results = json.load(f)
+    # 1. 读缓存
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            results = json.load(f)
+    except FileNotFoundError:
+        results = []
 
-    cached_title2idx = {result['title'].lower():i for i, result in enumerate(results)}
-    
+    cached_title2idx = {result['title'].lower(): i for i, result in enumerate(results)}
+
     untranslated_papers = []
-    translated_papers = []
+    hit_cnt = 0
+
     for paper in papers:
-        title = paper['title'].lower()
-        if title in cached_title2idx.keys():
-            translated_papers.append(
-                results[cached_title2idx[title]]
-            )
+        title_lower = paper['title'].lower()
+        if title_lower in cached_title2idx:
+            # 命中缓存 → 回填翻译/单位
+            hit_cnt += 1
+            cached = results[cached_title2idx[title_lower]]
+
+            if 'translated' in cached and not paper.get('translated'):
+                paper['translated'] = cached.get('translated', '')
+
+            if 'title_translated' in cached and not paper.get('title_translated'):
+                paper['title_translated'] = cached.get('title_translated', '')
+
+            # 单位：优先用本次 DeepSeek 的，如果空再用缓存
+            if not paper.get('affiliation') and cached.get('affiliation'):
+                paper['affiliation'] = cached.get('affiliation', '')
         else:
             untranslated_papers.append(paper)
-    
-    source = []
-    for paper in untranslated_papers:
-        source.append(paper['summary'])
-    target = translate(source)
-    if len(target) == len(untranslated_papers):
-        for i in range(len(untranslated_papers)):
-            untranslated_papers[i]['translated'] = target[i]
-    
-    results.extend(untranslated_papers)
 
+    # 2. 对“新论文”做摘要翻译
+    summaries = [p['summary'] for p in untranslated_papers]
+    if summaries:
+        target_summaries = translate(summaries)
+        if len(target_summaries) == len(untranslated_papers):
+            for p, t in zip(untranslated_papers, target_summaries):
+                p['translated'] = t
+
+    # 3. 对“新论文”做标题翻译
+    titles = [p['title'] for p in untranslated_papers]
+    if titles:
+        target_titles = translate(titles)
+        if len(target_titles) == len(untranslated_papers):
+            for p, t in zip(untranslated_papers, target_titles):
+                p['title_translated'] = t
+
+    # 4. 写回缓存
+    results.extend(untranslated_papers)
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4, ensure_ascii=False)
 
-    print(f'[+] 总检索条数: {len(papers)} | 命中缓存: {len(translated_papers)} | 实际返回: {len(untranslated_papers)}....')
+    print(f'[+] 总检索条数: {len(papers)} | 命中缓存: {hit_cnt} | 实际翻译: {len(untranslated_papers)}....')
 
-    return papers 
+    return papers
 
         
 def cronjob():
@@ -289,22 +335,34 @@ def cronjob():
         else:
             msg_title = f'{title}'
 
+        title_cn = paper.get("title_translated", "").strip()
+
         msg_url = f'URL: {url}'
         msg_pub_date = f'Pub Date：{pub_date}'
-        msg_summary = f'Summary：\n\n{summary}'
-        msg_translated = f'Translated (Powered by {MODEL_TYPE}):\n\n{translated}'
+        # 中文摘要
+        msg_translated = f'Translated Summary (Powered by {MODEL_TYPE}):\n\n{translated}'
 
         msg_affiliation = ""
         if affiliation:
             msg_affiliation = f'Affiliation（DeepSeek 抽取）：\n{affiliation}'
 
+        msg_title_cn = ""
+        if title_cn:
+            msg_title_cn = f'Title（中文）：{title_cn}'
+
         push_title = f'Arxiv:{QUERY}[{ii}]@{today}'
         msg_content = f"[{msg_title}]({url})\n\n{msg_pub_date}\n\n"
 
+        # 先中文标题
+        if msg_title_cn:
+            msg_content += msg_title_cn + "\n\n"
+
+        # 再作者单位
         if msg_affiliation:
             msg_content += msg_affiliation + "\n\n"
-        
-        msg_content += f"{msg_url}\n\n{msg_translated}\n\n{msg_summary}\n\n"
+
+        # 链接 + 中文摘要
+        msg_content += f"{msg_url}\n\n{msg_translated}\n\n"
 
         # send_wechat_message(push_title, msg_content, SERVERCHAN_API_KEY)
         send_feishu_message(push_title, msg_content)
